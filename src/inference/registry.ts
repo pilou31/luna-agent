@@ -15,6 +15,7 @@ import {
   modelRegistryGetAvailable,
   modelRegistrySetEnabled,
 } from "../state/database.js";
+import { LOCAL_MODE, LOCAL_MODELS } from "../local/local-mode.js";
 
 type Database = BetterSqlite3.Database;
 
@@ -39,6 +40,10 @@ export class ModelRegistry {
    * and models removed from the baseline are disabled.
    */
   initialize(): void {
+    if (LOCAL_MODE) {
+      this.initializeLocal();
+      return;
+    }
     const now = new Date().toISOString();
     const baselineIds = new Set(STATIC_MODEL_BASELINE.map((m) => m.modelId));
 
@@ -74,6 +79,29 @@ export class ModelRegistry {
         existing.provider !== "ollama" &&
         existing.provider !== "other"
       ) {
+        modelRegistrySetEnabled(this.db, existing.modelId, false);
+      }
+    }
+  }
+
+  /**
+   * Local mode: only the Anthropic models from LOCAL_MODELS are enabled, so the
+   * router never picks a model whose provider has no key configured.
+   */
+  private initializeLocal(): void {
+    const now = new Date().toISOString();
+    const localIds = new Set(LOCAL_MODELS.map((m) => m.modelId));
+    for (const model of LOCAL_MODELS) {
+      const existing = modelRegistryGet(this.db, model.modelId);
+      modelRegistryUpsert(this.db, {
+        ...model,
+        enabled: true,
+        createdAt: existing?.createdAt || now,
+        updatedAt: now,
+      });
+    }
+    for (const existing of modelRegistryGetAll(this.db)) {
+      if (!localIds.has(existing.modelId) && existing.enabled) {
         modelRegistrySetEnabled(this.db, existing.modelId, false);
       }
     }

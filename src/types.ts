@@ -333,6 +333,8 @@ export interface InferenceResponse {
   toolCalls?: InferenceToolCall[];
   usage: TokenUsage;
   finishReason: string;
+  /** Provider charges outside token usage, e.g. server-side web searches. */
+  extraCostCents?: number;
 }
 
 export interface InferenceOptions {

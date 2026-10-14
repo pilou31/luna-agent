@@ -49,6 +49,7 @@ import { ulid } from "ulid";
 import { ModelRegistry } from "../inference/registry.js";
 import { InferenceBudgetTracker } from "../inference/budget.js";
 import { InferenceRouter } from "../inference/router.js";
+import { LOCAL_MODE, LOCAL_DISABLED_TOOLS } from "../local/local-mode.js";
 import { MemoryRetriever } from "../memory/retrieval.js";
 import { MemoryIngestionPipeline } from "../memory/ingestion.js";
 import { DEFAULT_MEMORY_BUDGET } from "../types.js";
@@ -98,7 +99,9 @@ export async function runAgentLoop(
 
   const builtinTools = createBuiltinTools(identity.sandboxId);
   const installedTools = loadInstalledTools(db);
-  const tools = [...builtinTools, ...installedTools];
+  const tools = [...builtinTools, ...installedTools].filter(
+    (tool) => !LOCAL_MODE || !LOCAL_DISABLED_TOOLS.has(tool.name),
+  );
   const toolContext: ToolContext = {
     identity,
     config,

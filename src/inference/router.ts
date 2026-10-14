@@ -147,10 +147,13 @@ export class InferenceRouter {
     // 7. Calculate actual cost
     const inputTokens = response.usage?.promptTokens || 0;
     const outputTokens = response.usage?.completionTokens || 0;
+    // Claude Haiku 5.5 bills prompts over 100K tokens at 5x the base rate.
+    const longPromptMultiplier =
+      model.modelId.startsWith("claude-haiku-5") && inputTokens > 100_000 ? 5 : 1;
     const actualCostCents = Math.ceil(
-      (inputTokens / 1000) * model.costPer1kInput / 100 +
-      (outputTokens / 1000) * model.costPer1kOutput / 100,
-    );
+      ((inputTokens / 1000) * model.costPer1kInput / 100 +
+        (outputTokens / 1000) * model.costPer1kOutput / 100) * longPromptMultiplier,
+    ) + (response.extraCostCents || 0);
 
     // 8. Record cost
     this.budget.recordCost({
@@ -248,37 +251,18 @@ export class InferenceRouter {
 
   /**
    * Fix messages for Anthropic's API requirements:
-   * 1. Extract system messages
-   * 2. Merge consecutive same-role messages
-   * 3. Merge consecutive tool messages into a single user message
-   *    with multiple tool_result content blocks
+   * 1. Keep system messages (the Anthropic client extracts them)
+   * 2. Merge consecutive same-role user/assistant messages
+   * 3. Keep tool messages as-is: the Anthropic client turns them into
+   *    tool_result blocks paired with their tool_use ids. Flattening them to
+   *    plain text here breaks that pairing and the API rejects the request.
    */
   private fixAnthropicMessages(messages: ChatMessage[]): ChatMessage[] {
     const result: ChatMessage[] = [];
 
     for (const msg of messages) {
-      // System messages are handled separately by the Anthropic client
-      if (msg.role === "system") {
-        result.push(msg);
-        continue;
-      }
-
-      // Tool messages become user messages with tool_result content
-      if (msg.role === "tool") {
-        const last = result[result.length - 1];
-        // If previous message was also a tool (now a user), merge into it
-        if (last && last.role === "user" && (last as any)._toolResultMerged) {
-          // Append to the merged content
-          last.content = last.content + "\n[tool_result:" + (msg.tool_call_id || "unknown") + "] " + msg.content;
-          continue;
-        }
-        // Otherwise create a new user message
-        const userMsg: ChatMessage & { _toolResultMerged?: boolean } = {
-          role: "user",
-          content: "[tool_result:" + (msg.tool_call_id || "unknown") + "] " + msg.content,
-          _toolResultMerged: true,
-        };
-        result.push(userMsg);
+      if (msg.role === "system" || msg.role === "tool") {
+        result.push({ ...msg });
         continue;
       }
 
@@ -293,11 +277,6 @@ export class InferenceRouter {
       }
 
       result.push({ ...msg });
-    }
-
-    // Clean up internal markers
-    for (const msg of result) {
-      delete (msg as any)._toolResultMerged;
     }
 
     return result;

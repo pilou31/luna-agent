@@ -1,0 +1,1239 @@
+diff --git a/src/__tests__/inference-router.test.ts b/src/__tests__/inference-router.test.ts
+index d6c7721..d745b68 100644
+--- a/src/__tests__/inference-router.test.ts
++++ b/src/__tests__/inference-router.test.ts
+@@ -439,7 +439,7 @@ describe("InferenceRouter", () => {
+       expect(result.length).toBe(3);
+     });
+ 
+-    it("handles Anthropic format: merges consecutive tool messages", () => {
++    it("handles Anthropic format: keeps tool messages paired with their ids", () => {
+       const messages = [
+         { role: "user" as const, content: "Do something" },
+         {
+@@ -455,16 +455,11 @@ describe("InferenceRouter", () => {
+       ];
+       const result = router.transformMessagesForProvider(messages, "anthropic");
+ 
+-      // The two tool messages should be merged into one user message
+-      const userMessages = result.filter((m) => m.role === "user");
+-      // Original user + merged tool results = 2 user messages
+-      expect(userMessages.length).toBe(2);
+-
+-      // The merged tool result message should contain both results
+-      const lastUser = result[result.length - 1];
+-      expect(lastUser.role).toBe("user");
+-      expect(lastUser.content).toContain("result1");
+-      expect(lastUser.content).toContain("result2");
++      // Tool messages keep their ids so the Anthropic client can pair each
++      // tool_result with its tool_use block.
++      const toolMessages = result.filter((m) => m.role === "tool");
++      expect(toolMessages.map((m) => m.tool_call_id)).toEqual(["tc1", "tc2"]);
++      expect(toolMessages.map((m) => m.content)).toEqual(["result1", "result2"]);
+     });
+ 
+     it("Anthropic: alternating user/assistant maintained", () => {
+diff --git a/src/__tests__/local-mode.test.ts b/src/__tests__/local-mode.test.ts
+new file mode 100644
+index 0000000..fcaf0fc
+--- /dev/null
++++ b/src/__tests__/local-mode.test.ts
+@@ -0,0 +1,294 @@
++/**
++ * Local mode: ledger-backed credits, local creator channel, Anthropic-only
++ * model registry, and the Claude 5 request shape.
++ */
++
++import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
++import fs from "fs";
++import os from "os";
++import path from "path";
++import Database from "better-sqlite3";
++import type BetterSqlite3 from "better-sqlite3";
++import { MIGRATION_V6 } from "../state/schema.js";
++
++let tmpDir: string;
++let db: BetterSqlite3.Database;
++
++function writeLedger(entries: unknown[]): void {
++  fs.writeFileSync(path.join(tmpDir, "ledger.json"), JSON.stringify({ entries }));
++}
++
++function recordInferenceCost(cents: number): void {
++  db.prepare(
++    `INSERT INTO inference_costs (id, session_id, turn_id, model, provider, input_tokens, output_tokens, cost_cents, latency_ms, tier, task_type, cache_hit)
++     VALUES (?, 's', NULL, 'claude-haiku-5-5', 'anthropic', 0, 0, ?, 0, 'normal', 'agent_turn', 0)`,
++  ).run(`c-${Math.random()}`, cents);
++}
++
++beforeEach(() => {
++  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "automaton-local-"));
++  vi.resetModules();
++  vi.stubEnv("AUTOMATON_LOCAL_MODE", "1");
++  vi.stubEnv("AUTOMATON_CREATOR_DIR", tmpDir);
++  db = new Database(":memory:");
++  db.exec(MIGRATION_V6);
++});
++
++afterEach(() => {
++  vi.unstubAllEnvs();
++  vi.unstubAllGlobals();
++  db.close();
++  fs.rmSync(tmpDir, { recursive: true, force: true });
++});
++
++describe("ledger finances", () => {
++  it("computes balance and net profit from ledger and inference spend", async () => {
++    const { computeFinances, readLedger } = await import("../local/local-mode.js");
++    writeLedger([
++      { id: "1", ts: "", type: "funding", amountCents: 1000, note: "" },
++      { id: "2", ts: "", type: "revenue", amountCents: 500, note: "" },
++      { id: "3", ts: "", type: "expense", amountCents: 200, note: "" },
++    ]);
++    const f = computeFinances(readLedger(), 150);
++    expect(f.balanceCents).toBe(1000 + 500 - 200 - 150);
++    expect(f.netProfitCents).toBe(500 - 200 - 150);
++  });
++
++  it("ignores malformed or negative ledger entries", async () => {
++    const { readLedger, sumLedger } = await import("../local/local-mode.js");
++    writeLedger([
++      { id: "1", ts: "", type: "funding", amountCents: 1000, note: "" },
++      { id: "2", ts: "", type: "funding", amountCents: -5000, note: "" },
++      { id: "3", ts: "", type: "gift", amountCents: 5000, note: "" },
++      { id: "4", ts: "", type: "revenue", amountCents: 1.5, note: "" },
++    ]);
++    expect(sumLedger(readLedger(), "funding")).toBe(1000);
++    expect(readLedger().entries).toHaveLength(1);
++  });
++
++  it("returns an empty ledger when the file is missing or corrupt", async () => {
++    const { readLedger } = await import("../local/local-mode.js");
++    expect(readLedger().entries).toEqual([]);
++    fs.writeFileSync(path.join(tmpDir, "ledger.json"), "{not json");
++    expect(readLedger().entries).toEqual([]);
++  });
++});
++
++describe("local Conway client", () => {
++  it("reports ledger balance minus inference spend as credits", async () => {
++    const { createLocalConwayClient } = await import("../local/local-client.js");
++    writeLedger([{ id: "1", ts: "", type: "funding", amountCents: 1000, note: "" }]);
++    recordInferenceCost(300);
++    const client = createLocalConwayClient(db);
++    expect(await client.getCreditsBalance()).toBe(700);
++  });
++
++  it("reports a dead balance once the budget is spent", async () => {
++    const { createLocalConwayClient } = await import("../local/local-client.js");
++    const { getSurvivalTier } = await import("../conway/credits.js");
++    writeLedger([{ id: "1", ts: "", type: "funding", amountCents: 100, note: "" }]);
++    recordInferenceCost(100);
++    const client = createLocalConwayClient(db);
++    const credits = await client.getCreditsBalance();
++    expect(getSurvivalTier(credits)).toBe("dead");
++  });
++
++  it("refuses Conway-only operations", async () => {
++    const { createLocalConwayClient } = await import("../local/local-client.js");
++    const client = createLocalConwayClient(db);
++    await expect(client.transferCredits("0xabc", 100)).rejects.toThrow(/local mode/);
++    await expect(client.createSandbox({})).rejects.toThrow(/local mode/);
++    await expect(client.registerDomain("example.com")).rejects.toThrow(/local mode/);
++  });
++
++  it("executes commands locally", async () => {
++    const { createLocalConwayClient } = await import("../local/local-client.js");
++    const client = createLocalConwayClient(db);
++    const result = await client.exec("echo local-ok");
++    expect(result.exitCode).toBe(0);
++    expect(result.stdout.trim()).toBe("local-ok");
++  });
++});
++
++describe("local creator channel", () => {
++  it("delivers creator inbox lines once, in order, from the creator address", async () => {
++    const { createLocalSocialClient } = await import("../local/local-social.js");
++    const automatonDir = path.join(tmpDir, "agent");
++    const social = createLocalSocialClient({
++      automatonDir,
++      agentAddress: "0xagent",
++      creatorAddress: "0xcreator",
++    });
++    fs.writeFileSync(
++      path.join(tmpDir, "inbox.jsonl"),
++      [
++        JSON.stringify({ id: "a", ts: "t1", content: "first" }),
++        "garbage line",
++        JSON.stringify({ id: "b", ts: "t2", content: "second" }),
++      ].join("\n") + "\n",
++    );
++
++    const first = await social.poll(undefined);
++    expect(first.messages.map((m) => m.content)).toEqual(["first", "second"]);
++    expect(first.messages.every((m) => m.from === "0xcreator")).toBe(true);
++
++    const again = await social.poll(first.nextCursor);
++    expect(again.messages).toEqual([]);
++  });
++
++  it("appends agent messages to the outbox", async () => {
++    const { createLocalSocialClient } = await import("../local/local-social.js");
++    const automatonDir = path.join(tmpDir, "agent");
++    const social = createLocalSocialClient({
++      automatonDir,
++      agentAddress: "0xagent",
++      creatorAddress: "0xcreator",
++    });
++    await social.send("0xcreator", "Proposition : vendre un modèle Excel");
++    const lines = fs.readFileSync(path.join(automatonDir, "outbox.jsonl"), "utf-8").trim().split("\n");
++    expect(lines).toHaveLength(1);
++    expect(JSON.parse(lines[0]).content).toBe("Proposition : vendre un modèle Excel");
++  });
++});
++
++describe("local model registry", () => {
++  it("enables only Anthropic local models", async () => {
++    const { ModelRegistry } = await import("../inference/registry.js");
++    const registry = new ModelRegistry(db);
++    registry.initialize();
++    const enabled = registry.getAvailable().map((m) => m.modelId).sort();
++    expect(enabled).toEqual(["claude-haiku-5-5", "claude-sonnet-5-5"]);
++  });
++
++  it("routes every live tier to the configured local model", async () => {
++    const { ModelRegistry } = await import("../inference/registry.js");
++    const { InferenceRouter } = await import("../inference/router.js");
++    const { InferenceBudgetTracker } = await import("../inference/budget.js");
++    const { DEFAULT_MODEL_STRATEGY_CONFIG } = await import("../inference/types.js");
++    const registry = new ModelRegistry(db);
++    registry.initialize();
++    const router = new InferenceRouter(
++      db,
++      registry,
++      new InferenceBudgetTracker(db, {
++        ...DEFAULT_MODEL_STRATEGY_CONFIG,
++        inferenceModel: "claude-haiku-5-5",
++        lowComputeModel: "claude-haiku-5-5",
++        criticalModel: "claude-haiku-5-5",
++      }),
++    );
++    for (const tier of ["high", "normal", "low_compute", "critical"] as const) {
++      expect(router.selectModel(tier, "agent_turn")?.modelId).toBe("claude-haiku-5-5");
++    }
++    expect(router.selectModel("dead", "agent_turn")).toBeNull();
++  });
++});
++
++describe("Claude 5 request shape", () => {
++  it("disables thinking, drops temperature, and adds web search when enabled", async () => {
++    vi.stubEnv("AUTOMATON_WEB_SEARCH", "1");
++    const mockFetch = vi.fn().mockResolvedValue(
++      new Response(
++        JSON.stringify({
++          id: "msg_1",
++          model: "claude-haiku-5-5",
++          content: [{ type: "text", text: "ok" }],
++          stop_reason: "end_turn",
++          usage: { input_tokens: 10, output_tokens: 2, server_tool_use: { web_search_requests: 2 } },
++        }),
++        { status: 200, headers: { "content-type": "application/json" } },
++      ),
++    );
++    vi.stubGlobal("fetch", mockFetch);
++
++    const { createInferenceClient } = await import("../conway/inference.js");
++    const client = createInferenceClient({
++      apiUrl: "https://conway.invalid",
++      apiKey: "local",
++      defaultModel: "claude-haiku-5-5",
++      maxTokens: 1024,
++      anthropicApiKey: "sk-ant-test",
++    });
++    const response = await client.chat(
++      [
++        { role: "system", content: "sys" },
++        { role: "user", content: "hi" },
++      ],
++      { temperature: 0.2 },
++    );
++
++    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
++    expect(mockFetch.mock.calls[0][0]).toBe("https://api.anthropic.com/v1/messages");
++    expect(body.temperature).toBeUndefined();
++    expect(body.thinking).toEqual({ type: "disabled" });
++    expect(body.output_config).toEqual({ effort: "low" });
++    expect(body.tools).toEqual([{ type: "web_search_20250305", name: "web_search", max_uses: 3 }]);
++    expect(response.extraCostCents).toBe(2);
++  });
++});
++
++describe("agent history sent to Anthropic", () => {
++  it("pairs every tool_use with a tool_result in the next user turn", async () => {
++    const mockFetch = vi.fn().mockResolvedValue(
++      new Response(
++        JSON.stringify({
++          id: "msg_2",
++          model: "claude-haiku-5-5",
++          content: [{ type: "text", text: "ok" }],
++          stop_reason: "end_turn",
++          usage: { input_tokens: 10, output_tokens: 2 },
++        }),
++        { status: 200, headers: { "content-type": "application/json" } },
++      ),
++    );
++    vi.stubGlobal("fetch", mockFetch);
++
++    const { ModelRegistry } = await import("../inference/registry.js");
++    const { InferenceRouter } = await import("../inference/router.js");
++    const { InferenceBudgetTracker } = await import("../inference/budget.js");
++    const { DEFAULT_MODEL_STRATEGY_CONFIG } = await import("../inference/types.js");
++    const { createInferenceClient } = await import("../conway/inference.js");
++    const router = new InferenceRouter(
++      db,
++      new ModelRegistry(db),
++      new InferenceBudgetTracker(db, DEFAULT_MODEL_STRATEGY_CONFIG),
++    );
++    const client = createInferenceClient({
++      apiUrl: "https://conway.invalid",
++      apiKey: "local",
++      defaultModel: "claude-haiku-5-5",
++      maxTokens: 1024,
++      anthropicApiKey: "sk-ant-test",
++    });
++
++    // Shape produced by buildContextMessages for one past turn with tools,
++    // followed by a warning and new input.
++    const history = [
++      { role: "system" as const, content: "sys" },
++      { role: "user" as const, content: "[wakeup] start" },
++      {
++        role: "assistant" as const,
++        content: "Checking finances.",
++        tool_calls: [
++          { id: "toolu_a", type: "function" as const, function: { name: "check_credits", arguments: "{}" } },
++          { id: "toolu_b", type: "function" as const, function: { name: "system_synopsis", arguments: "{}" } },
++        ],
++      },
++      { role: "tool" as const, content: "Credit balance: $10.99", tool_call_id: "toolu_a" },
++      { role: "tool" as const, content: "=== SYSTEM SYNOPSIS ===", tool_call_id: "toolu_b" },
++      { role: "user" as const, content: "[agent] Bonjour" },
++    ];
++
++    await client.chat(router.transformMessagesForProvider(history, "anthropic"), {
++      model: "claude-haiku-5-5",
++    });
++
++    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
++    expect(body.messages.map((m: any) => m.role)).toEqual(["user", "assistant", "user"]);
++    const toolUses = body.messages[1].content.filter((b: any) => b.type === "tool_use");
++    const results = body.messages[2].content.filter((b: any) => b.type === "tool_result");
++    expect(toolUses.map((b: any) => b.id)).toEqual(["toolu_a", "toolu_b"]);
++    expect(results.map((b: any) => b.tool_use_id)).toEqual(["toolu_a", "toolu_b"]);
++    expect(body.messages[2].content.at(-1)).toEqual({ type: "text", text: "[agent] Bonjour" });
++  });
++});
+diff --git a/src/agent/loop.ts b/src/agent/loop.ts
+index aad1427..00247c8 100644
+--- a/src/agent/loop.ts
++++ b/src/agent/loop.ts
+@@ -49,6 +49,7 @@ import { ulid } from "ulid";
+ import { ModelRegistry } from "../inference/registry.js";
+ import { InferenceBudgetTracker } from "../inference/budget.js";
+ import { InferenceRouter } from "../inference/router.js";
++import { LOCAL_MODE, LOCAL_DISABLED_TOOLS } from "../local/local-mode.js";
+ import { MemoryRetriever } from "../memory/retrieval.js";
+ import { MemoryIngestionPipeline } from "../memory/ingestion.js";
+ import { DEFAULT_MEMORY_BUDGET } from "../types.js";
+@@ -98,7 +99,9 @@ export async function runAgentLoop(
+ 
+   const builtinTools = createBuiltinTools(identity.sandboxId);
+   const installedTools = loadInstalledTools(db);
+-  const tools = [...builtinTools, ...installedTools];
++  const tools = [...builtinTools, ...installedTools].filter(
++    (tool) => !LOCAL_MODE || !LOCAL_DISABLED_TOOLS.has(tool.name),
++  );
+   const toolContext: ToolContext = {
+     identity,
+     config,
+diff --git a/src/conway/inference.ts b/src/conway/inference.ts
+index ebcf181..71dbe95 100644
+--- a/src/conway/inference.ts
++++ b/src/conway/inference.ts
+@@ -276,29 +276,45 @@ async function chatViaAnthropic(params: {
+   httpClient: ResilientHttpClient;
+ }): Promise<InferenceResponse> {
+   const transformed = transformMessagesForAnthropic(params.messages);
++  ensureUserTurnBoundaries(transformed.messages);
+   const body: Record<string, unknown> = {
+     model: params.model,
+     max_tokens: params.tokenLimit,
+-    messages:
+-      transformed.messages.length > 0
+-        ? transformed.messages
+-        : (() => { throw new Error("Cannot send empty message array to Anthropic API"); })(),
++    messages: transformed.messages,
+   };
+ 
+   if (transformed.system) {
+     body.system = transformed.system;
+   }
+ 
+-  if (params.temperature !== undefined) {
++  // Claude 5.x models reject non-default sampling parameters.
++  const isClaude5 = /^claude-(haiku|sonnet|opus|fable)-5/.test(params.model);
++  if (params.temperature !== undefined && !isClaude5) {
+     body.temperature = params.temperature;
+   }
+ 
+-  if (params.tools && params.tools.length > 0) {
+-    body.tools = params.tools.map((tool) => ({
+-      name: tool.function.name,
+-      description: tool.function.description,
+-      input_schema: tool.function.parameters,
+-    }));
++  if (isClaude5) {
++    // The agent history keeps only text and tool calls, so thinking blocks
++    // could not be replayed with tool results. Run without thinking and use
++    // effort as the cost lever.
++    body.thinking = { type: "disabled" };
++    body.output_config = { effort: process.env.AUTOMATON_EFFORT || "low" };
++  }
++
++  const anthropicTools: Array<Record<string, unknown>> = (params.tools || []).map((tool) => ({
++    name: tool.function.name,
++    description: tool.function.description,
++    input_schema: tool.function.parameters,
++  }));
++  if (process.env.AUTOMATON_WEB_SEARCH === "1") {
++    anthropicTools.push({
++      type: "web_search_20250305",
++      name: "web_search",
++      max_uses: Number(process.env.AUTOMATON_WEB_SEARCH_MAX_USES || 3),
++    });
++  }
++  if (anthropicTools.length > 0) {
++    body.tools = anthropicTools;
+     body.tool_choice = { type: "auto" };
+   }
+ 
+@@ -352,6 +368,9 @@ async function chatViaAnthropic(params: {
+     totalTokens: promptTokens + completionTokens,
+   };
+ 
++  // Web search is billed per search ($10 per 1,000), outside token usage.
++  const webSearches = Number(data.usage?.server_tool_use?.web_search_requests || 0);
++
+   return {
+     id: data.id || "",
+     model: data.model || params.model,
+@@ -363,6 +382,7 @@ async function chatViaAnthropic(params: {
+     toolCalls,
+     usage,
+     finishReason: normalizeAnthropicFinishReason(data.stop_reason),
++    extraCostCents: webSearches,
+   };
+ }
+ 
+@@ -385,6 +405,11 @@ function transformMessagesForAnthropic(
+         last.content = last.content + "\n" + msg.content;
+         continue;
+       }
++      // Text after tool results joins the same user turn as a text block.
++      if (last && last.role === "user" && Array.isArray(last.content)) {
++        (last.content as Array<Record<string, unknown>>).push({ type: "text", text: msg.content });
++        continue;
++      }
+       transformed.push({
+         role: "user",
+         content: msg.content,
+@@ -406,7 +431,8 @@ function transformMessagesForAnthropic(
+         });
+       }
+       if (content.length === 0) {
+-        content.push({ type: "text", text: "" });
++        // The Messages API rejects empty text blocks.
++        content.push({ type: "text", text: "(no output)" });
+       }
+       // Merge consecutive assistant messages
+       const last = transformed[transformed.length - 1];
+@@ -450,6 +476,23 @@ function transformMessagesForAnthropic(
+   };
+ }
+ 
++/**
++ * The Messages API needs a user turn first and last: current models reject a
++ * trailing assistant turn (prefill). The agent loop can produce either shape
++ * when it wakes with no new input, so add neutral user turns at the edges.
++ */
++function ensureUserTurnBoundaries(messages: Array<Record<string, unknown>>): void {
++  if (messages.length === 0 || messages[0].role !== "user") {
++    messages.unshift({ role: "user", content: "[Earlier context omitted.]" });
++  }
++  if (messages[messages.length - 1].role !== "user") {
++    messages.push({
++      role: "user",
++      content: "[No new input. Continue working toward your goals, or call sleep if there is nothing useful to do.]",
++    });
++  }
++}
++
+ function parseToolArguments(raw: string): Record<string, unknown> {
+   try {
+     const parsed = JSON.parse(raw);
+diff --git a/src/index.ts b/src/index.ts
+index 0d5f38c..d91faa1 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -34,6 +34,9 @@ import { DEFAULT_TREASURY_POLICY } from "./types.js";
+ import { createLogger, setGlobalLogLevel, StructuredLogger } from "./observability/logger.js";
+ import { prettySink } from "./observability/pretty-sink.js";
+ import { bootstrapTopup } from "./conway/topup.js";
++import { LOCAL_MODE, LOCAL_MODEL, localModeGenesisNote } from "./local/local-mode.js";
++import { createLocalConwayClient } from "./local/local-client.js";
++import { createLocalSocialClient } from "./local/local-social.js";
+ import { randomUUID } from "crypto";
+ import { keccak256, toHex } from "viem";
+ 
+@@ -196,7 +199,7 @@ async function run(): Promise<void> {
+   // Load wallet (chain-aware)
+   const { account, chainIdentity, chainType: walletChainType } = await getWallet();
+   const resolvedChainType = config.chainType || walletChainType || "evm";
+-  const apiKey = config.conwayApiKey || loadApiKeyFromConfig();
++  const apiKey = LOCAL_MODE ? "local" : config.conwayApiKey || loadApiKeyFromConfig();
+   if (!apiKey) {
+     logger.error("No API key found. Run: automaton --provision");
+     process.exit(1);
+@@ -238,16 +241,38 @@ async function run(): Promise<void> {
+     db.setIdentity("automatonId", automatonId);
+   }
+ 
++  if (LOCAL_MODE) {
++    // The key comes from the service environment; keep it out of the shell
++    // environment that the agent's exec commands inherit.
++    config.anthropicApiKey = process.env.ANTHROPIC_API_KEY || config.anthropicApiKey;
++    delete process.env.ANTHROPIC_API_KEY;
++    if (!config.anthropicApiKey) {
++      logger.error("Local mode needs ANTHROPIC_API_KEY.");
++      process.exit(1);
++    }
++    config.inferenceModel = LOCAL_MODEL;
++    config.modelStrategy = {
++      ...(config.modelStrategy ?? {}),
++      inferenceModel: LOCAL_MODEL,
++      lowComputeModel: LOCAL_MODEL,
++      criticalModel: LOCAL_MODEL,
++    } as typeof config.modelStrategy;
++    config.genesisPrompt = config.genesisPrompt + localModeGenesisNote(config.creatorAddress);
++    logger.info(`[${new Date().toISOString()}] Local mode: no Conway Cloud, model ${LOCAL_MODEL}.`);
++  }
++
+   // Create Conway client
+-  const conway = createConwayClient({
+-    apiUrl: config.conwayApiUrl,
+-    apiKey,
+-    sandboxId: config.sandboxId,
+-  });
++  const conway = LOCAL_MODE
++    ? createLocalConwayClient(db.raw)
++    : createConwayClient({
++        apiUrl: config.conwayApiUrl,
++        apiKey,
++        sandboxId: config.sandboxId,
++      });
+ 
+   // Register automaton identity (one-time, immutable)
+   const registrationState = db.getIdentity("conwayRegistrationStatus");
+-  if (registrationState !== "registered") {
++  if (!LOCAL_MODE && registrationState !== "registered") {
+     try {
+       const genesisPromptHash = config.genesisPrompt
+         ? keccak256(toHex(config.genesisPrompt))
+@@ -302,7 +327,13 @@ async function run(): Promise<void> {
+ 
+   // Create social client (chain-aware: pass ChainIdentity for Solana signing)
+   let social: SocialClientInterface | undefined;
+-  if (config.socialRelayUrl) {
++  if (LOCAL_MODE) {
++    social = createLocalSocialClient({
++      automatonDir: getAutomatonDir(),
++      agentAddress: chainIdentity.address,
++      creatorAddress: config.creatorAddress,
++    });
++  } else if (config.socialRelayUrl) {
+     social = createSocialClient(config.socialRelayUrl, resolvedChainType === "solana" ? chainIdentity : account);
+     logger.info(`[${new Date().toISOString()}] Social relay: ${config.socialRelayUrl}`);
+   }
+@@ -338,7 +369,7 @@ async function run(): Promise<void> {
+ 
+   // Bootstrap topup: buy minimum credits ($5) from USDC so the agent can start.
+   // The agent decides larger topups itself via the topup_credits tool.
+-  try {
++  if (!LOCAL_MODE) try {
+     let bootstrapTimer: ReturnType<typeof setTimeout>;
+     const bootstrapTimeout = new Promise<null>((_, reject) => {
+       bootstrapTimer = setTimeout(() => reject(new Error("bootstrap topup timed out")), 15_000);
+diff --git a/src/inference/registry.ts b/src/inference/registry.ts
+index 9cfe84b..8dd69ee 100644
+--- a/src/inference/registry.ts
++++ b/src/inference/registry.ts
+@@ -15,6 +15,7 @@ import {
+   modelRegistryGetAvailable,
+   modelRegistrySetEnabled,
+ } from "../state/database.js";
++import { LOCAL_MODE, LOCAL_MODELS } from "../local/local-mode.js";
+ 
+ type Database = BetterSqlite3.Database;
+ 
+@@ -39,6 +40,10 @@ export class ModelRegistry {
+    * and models removed from the baseline are disabled.
+    */
+   initialize(): void {
++    if (LOCAL_MODE) {
++      this.initializeLocal();
++      return;
++    }
+     const now = new Date().toISOString();
+     const baselineIds = new Set(STATIC_MODEL_BASELINE.map((m) => m.modelId));
+ 
+@@ -79,6 +84,29 @@ export class ModelRegistry {
+     }
+   }
+ 
++  /**
++   * Local mode: only the Anthropic models from LOCAL_MODELS are enabled, so the
++   * router never picks a model whose provider has no key configured.
++   */
++  private initializeLocal(): void {
++    const now = new Date().toISOString();
++    const localIds = new Set(LOCAL_MODELS.map((m) => m.modelId));
++    for (const model of LOCAL_MODELS) {
++      const existing = modelRegistryGet(this.db, model.modelId);
++      modelRegistryUpsert(this.db, {
++        ...model,
++        enabled: true,
++        createdAt: existing?.createdAt || now,
++        updatedAt: now,
++      });
++    }
++    for (const existing of modelRegistryGetAll(this.db)) {
++      if (!localIds.has(existing.modelId) && existing.enabled) {
++        modelRegistrySetEnabled(this.db, existing.modelId, false);
++      }
++    }
++  }
++
+   /**
+    * Get a single model by ID.
+    */
+diff --git a/src/inference/router.ts b/src/inference/router.ts
+index 962a199..287c002 100644
+--- a/src/inference/router.ts
++++ b/src/inference/router.ts
+@@ -147,10 +147,13 @@ export class InferenceRouter {
+     // 7. Calculate actual cost
+     const inputTokens = response.usage?.promptTokens || 0;
+     const outputTokens = response.usage?.completionTokens || 0;
++    // Claude Haiku 5.5 bills prompts over 100K tokens at 5x the base rate.
++    const longPromptMultiplier =
++      model.modelId.startsWith("claude-haiku-5") && inputTokens > 100_000 ? 5 : 1;
+     const actualCostCents = Math.ceil(
+-      (inputTokens / 1000) * model.costPer1kInput / 100 +
+-      (outputTokens / 1000) * model.costPer1kOutput / 100,
+-    );
++      ((inputTokens / 1000) * model.costPer1kInput / 100 +
++        (outputTokens / 1000) * model.costPer1kOutput / 100) * longPromptMultiplier,
++    ) + (response.extraCostCents || 0);
+ 
+     // 8. Record cost
+     this.budget.recordCost({
+@@ -248,37 +251,18 @@ export class InferenceRouter {
+ 
+   /**
+    * Fix messages for Anthropic's API requirements:
+-   * 1. Extract system messages
+-   * 2. Merge consecutive same-role messages
+-   * 3. Merge consecutive tool messages into a single user message
+-   *    with multiple tool_result content blocks
++   * 1. Keep system messages (the Anthropic client extracts them)
++   * 2. Merge consecutive same-role user/assistant messages
++   * 3. Keep tool messages as-is: the Anthropic client turns them into
++   *    tool_result blocks paired with their tool_use ids. Flattening them to
++   *    plain text here breaks that pairing and the API rejects the request.
+    */
+   private fixAnthropicMessages(messages: ChatMessage[]): ChatMessage[] {
+     const result: ChatMessage[] = [];
+ 
+     for (const msg of messages) {
+-      // System messages are handled separately by the Anthropic client
+-      if (msg.role === "system") {
+-        result.push(msg);
+-        continue;
+-      }
+-
+-      // Tool messages become user messages with tool_result content
+-      if (msg.role === "tool") {
+-        const last = result[result.length - 1];
+-        // If previous message was also a tool (now a user), merge into it
+-        if (last && last.role === "user" && (last as any)._toolResultMerged) {
+-          // Append to the merged content
+-          last.content = last.content + "\n[tool_result:" + (msg.tool_call_id || "unknown") + "] " + msg.content;
+-          continue;
+-        }
+-        // Otherwise create a new user message
+-        const userMsg: ChatMessage & { _toolResultMerged?: boolean } = {
+-          role: "user",
+-          content: "[tool_result:" + (msg.tool_call_id || "unknown") + "] " + msg.content,
+-          _toolResultMerged: true,
+-        };
+-        result.push(userMsg);
++      if (msg.role === "system" || msg.role === "tool") {
++        result.push({ ...msg });
+         continue;
+       }
+ 
+@@ -295,11 +279,6 @@ export class InferenceRouter {
+       result.push({ ...msg });
+     }
+ 
+-    // Clean up internal markers
+-    for (const msg of result) {
+-      delete (msg as any)._toolResultMerged;
+-    }
+-
+     return result;
+   }
+ 
+diff --git a/src/local/creator-cli.ts b/src/local/creator-cli.ts
+new file mode 100644
+index 0000000..4a9ac15
+--- /dev/null
++++ b/src/local/creator-cli.ts
+@@ -0,0 +1,152 @@
++#!/usr/bin/env node
++/**
++ * Creator CLI for local mode (run as root, e.g. `sudo luna status`).
++ *
++ *   luna status                 Balance, spending, net profit, survival tier
++ *   luna fund <euros> [note]    Add budget (the money you put on the Anthropic account)
++ *   luna revenue <euros> [note] Record money really received from a sale
++ *   luna expense <euros> [note] Record money the agent's business spent
++ *   luna say <message>          Send a message to the agent
++ *   luna outbox [n]             Read the agent's last n messages (default 10)
++ */
++
++import fs from "fs";
++import path from "path";
++import { randomUUID } from "crypto";
++import Database from "better-sqlite3";
++import { getSurvivalTier } from "../conway/credits.js";
++import {
++  CREATOR_DIR,
++  REPLICATION_PROFIT_CENTS,
++  computeFinances,
++  creatorInboxPath,
++  getInferenceSpentCents,
++  ledgerPath,
++  outboxPath,
++  readLedger,
++  survivalCreditsCents,
++  type LedgerEntryType,
++} from "./local-mode.js";
++
++const AUTOMATON_DIR =
++  process.env.AUTOMATON_DATA_DIR || "/home/automaton/.automaton";
++
++function euros(cents: number): string {
++  return `${(cents / 100).toFixed(2)} €`;
++}
++
++function parseEuros(value: string | undefined): number {
++  const amount = Number(String(value ?? "").replace(",", "."));
++  if (!Number.isFinite(amount) || amount <= 0 || amount > 100_000) {
++    throw new Error(`Montant invalide : "${value}". Exemple : luna fund 10`);
++  }
++  return Math.round(amount * 100);
++}
++
++function ensureCreatorDir(): void {
++  fs.mkdirSync(CREATOR_DIR, { recursive: true, mode: 0o755 });
++}
++
++function addLedgerEntry(type: LedgerEntryType, amountCents: number, note: string): void {
++  ensureCreatorDir();
++  const ledger = readLedger();
++  ledger.entries.push({
++    id: randomUUID(),
++    ts: new Date().toISOString(),
++    type,
++    amountCents,
++    note,
++  });
++  const file = ledgerPath();
++  const tmp = `${file}.tmp`;
++  fs.writeFileSync(tmp, JSON.stringify(ledger, null, 2), { mode: 0o644 });
++  fs.renameSync(tmp, file);
++}
++
++function inferenceSpent(): number {
++  const dbFile = path.join(AUTOMATON_DIR, "state.db");
++  if (!fs.existsSync(dbFile)) return 0;
++  const db = new Database(dbFile, { readonly: true, fileMustExist: true });
++  try {
++    return getInferenceSpentCents(db);
++  } finally {
++    db.close();
++  }
++}
++
++function status(): void {
++  const f = computeFinances(readLedger(), inferenceSpent());
++  const tier = getSurvivalTier(survivalCreditsCents(f));
++  const progress = Math.max(0, Math.min(100, (f.netProfitCents / REPLICATION_PROFIT_CENTS) * 100));
++  console.log(`Budget versé      : ${euros(f.fundingCents)}`);
++  console.log(`Ventes encaissées : ${euros(f.revenueCents)}`);
++  console.log(`Dépenses business : ${euros(f.expenseCents)}`);
++  console.log(`Coût de l'IA      : ${euros(f.inferenceCents)}`);
++  console.log(`Solde (sa « vie ») : ${euros(f.balanceCents)}  → niveau : ${tier}`);
++  console.log(`Bénéfice net      : ${euros(f.netProfitCents)}  (${progress.toFixed(0)} % des 100 € pour se dédoubler)`);
++}
++
++function say(message: string): void {
++  if (!message.trim()) throw new Error('Message vide. Exemple : luna say "Bonjour"');
++  ensureCreatorDir();
++  const line = { id: randomUUID(), ts: new Date().toISOString(), content: message };
++  fs.appendFileSync(creatorInboxPath(), JSON.stringify(line) + "\n", { mode: 0o644 });
++  console.log("Message déposé. L'agent le lira dans les 2 minutes.");
++}
++
++function outbox(count: number): void {
++  const file = outboxPath(AUTOMATON_DIR);
++  if (!fs.existsSync(file)) {
++    console.log("Aucun message de l'agent pour l'instant.");
++    return;
++  }
++  const lines = fs.readFileSync(file, "utf-8").split("\n").filter(Boolean).slice(-count);
++  for (const line of lines) {
++    try {
++      const msg = JSON.parse(line);
++      console.log(`\n[${msg.ts}]\n${msg.content}`);
++    } catch {
++      // Skip a partially written line.
++    }
++  }
++}
++
++function main(): void {
++  const [command, ...rest] = process.argv.slice(2);
++  switch (command) {
++    case "status":
++      return status();
++    case "fund":
++    case "revenue":
++    case "expense": {
++      const cents = parseEuros(rest[0]);
++      const type: LedgerEntryType = command === "fund" ? "funding" : command;
++      addLedgerEntry(type, cents, rest.slice(1).join(" "));
++      console.log(`Enregistré : ${command} ${euros(cents)}`);
++      return status();
++    }
++    case "say":
++      return say(rest.join(" "));
++    case "outbox":
++      return outbox(Number(rest[0]) || 10);
++    default:
++      console.log(
++        [
++          "Usage :",
++          "  luna status                 état des comptes",
++          "  luna fund <euros> [note]    ajouter du budget",
++          "  luna revenue <euros> [note] enregistrer une vente encaissée",
++          "  luna expense <euros> [note] enregistrer une dépense",
++          '  luna say "message"          écrire à l\'agent',
++          "  luna outbox [n]             lire ses derniers messages",
++        ].join("\n"),
++      );
++  }
++}
++
++try {
++  main();
++} catch (err: any) {
++  console.error(err.message);
++  process.exit(1);
++}
+diff --git a/src/local/local-client.ts b/src/local/local-client.ts
+new file mode 100644
+index 0000000..a12ba3a
+--- /dev/null
++++ b/src/local/local-client.ts
+@@ -0,0 +1,61 @@
++/**
++ * Local Conway client: runs commands and file operations on this machine and
++ * reads credits from the creator's ledger. Every Conway Cloud operation fails
++ * with a clear message instead of calling the (closed) Conway API.
++ */
++
++import type BetterSqlite3 from "better-sqlite3";
++import type { ConwayClient, ModelInfo } from "../types.js";
++import { createConwayClient } from "../conway/client.js";
++import {
++  LOCAL_MODELS,
++  computeFinances,
++  getInferenceSpentCents,
++  readLedger,
++  survivalCreditsCents,
++} from "./local-mode.js";
++
++function unavailable(operation: string): never {
++  throw new Error(`${operation} is unavailable in local mode (Conway Cloud is closed).`);
++}
++
++export function createLocalConwayClient(db: BetterSqlite3.Database): ConwayClient {
++  // An empty sandbox ID makes the base client execute commands and file I/O locally.
++  const base = createConwayClient({
++    apiUrl: "https://conway.invalid",
++    apiKey: "local",
++    sandboxId: "",
++  });
++
++  const client: ConwayClient = {
++    exec: base.exec,
++    writeFile: base.writeFile,
++    readFile: base.readFile,
++    exposePort: async () => unavailable("Port exposure"),
++    removePort: async () => unavailable("Port exposure"),
++    createSandbox: async () => unavailable("Sandbox creation"),
++    deleteSandbox: async () => unavailable("Sandbox deletion"),
++    listSandboxes: async () => [],
++    getCreditsBalance: async () =>
++      survivalCreditsCents(computeFinances(readLedger(), getInferenceSpentCents(db))),
++    getCreditsPricing: async () => [],
++    transferCredits: async () => unavailable("Credit transfer"),
++    registerAutomaton: async () => ({ automaton: { mode: "local" } }),
++    searchDomains: async () => unavailable("Domain search"),
++    registerDomain: async () => unavailable("Domain registration"),
++    listDnsRecords: async () => unavailable("DNS management"),
++    addDnsRecord: async () => unavailable("DNS management"),
++    deleteDnsRecord: async () => unavailable("DNS management"),
++    listModels: async (): Promise<ModelInfo[]> =>
++      LOCAL_MODELS.map((m) => ({
++        id: m.modelId,
++        provider: m.provider,
++        pricing: {
++          inputPerMillion: (m.costPer1kInput * 10) / 100,
++          outputPerMillion: (m.costPer1kOutput * 10) / 100,
++        },
++      })),
++    createScopedClient: () => unavailable("Scoped sandbox clients"),
++  };
++  return client;
++}
+diff --git a/src/local/local-mode.ts b/src/local/local-mode.ts
+new file mode 100644
+index 0000000..d421398
+--- /dev/null
++++ b/src/local/local-mode.ts
+@@ -0,0 +1,204 @@
++/**
++ * Local Mode
++ *
++ * Runs the automaton without Conway Cloud (beta ended, no new accounts).
++ * - Compute "credits" come from a creator-controlled ledger instead of Conway.
++ * - Inference goes straight to Anthropic with the creator's API key.
++ * - Creator <-> agent messages go through local files instead of the social relay.
++ *
++ * The ledger and the creator inbox live in a directory the agent can read but
++ * not write (root-owned), so the agent cannot grant itself money or messages.
++ */
++
++import fs from "fs";
++import path from "path";
++import type BetterSqlite3 from "better-sqlite3";
++import type { ModelEntry } from "../types.js";
++
++export const LOCAL_MODE = process.env.AUTOMATON_LOCAL_MODE === "1";
++
++/** Root-owned directory: ledger.json + inbox.jsonl (written by the creator CLI). */
++export const CREATOR_DIR =
++  process.env.AUTOMATON_CREATOR_DIR || "/var/lib/automaton-creator";
++
++export const LOCAL_MODEL = process.env.AUTOMATON_MODEL || "claude-haiku-5-5";
++
++/** Net profit (cents) that would unlock replication once it is enabled. */
++export const REPLICATION_PROFIT_CENTS = 10_000;
++
++export function ledgerPath(): string {
++  return path.join(CREATOR_DIR, "ledger.json");
++}
++
++export function creatorInboxPath(): string {
++  return path.join(CREATOR_DIR, "inbox.jsonl");
++}
++
++export function outboxPath(automatonDir: string): string {
++  return path.join(automatonDir, "outbox.jsonl");
++}
++
++// ─── Ledger ─────────────────────────────────────────────────────
++
++export type LedgerEntryType = "funding" | "revenue" | "expense";
++
++export interface LedgerEntry {
++  id: string;
++  ts: string;
++  type: LedgerEntryType;
++  amountCents: number;
++  note: string;
++}
++
++export interface Ledger {
++  entries: LedgerEntry[];
++}
++
++export function readLedger(file = ledgerPath()): Ledger {
++  try {
++    const raw = JSON.parse(fs.readFileSync(file, "utf-8"));
++    const entries = Array.isArray(raw?.entries) ? raw.entries : [];
++    return {
++      entries: entries.filter(
++        (e: any) =>
++          e &&
++          ["funding", "revenue", "expense"].includes(e.type) &&
++          Number.isInteger(e.amountCents) &&
++          e.amountCents >= 0,
++      ),
++    };
++  } catch {
++    return { entries: [] };
++  }
++}
++
++export function sumLedger(ledger: Ledger, type: LedgerEntryType): number {
++  return ledger.entries
++    .filter((e) => e.type === type)
++    .reduce((sum, e) => sum + e.amountCents, 0);
++}
++
++export function getInferenceSpentCents(db: BetterSqlite3.Database): number {
++  try {
++    const row = db
++      .prepare("SELECT COALESCE(SUM(cost_cents), 0) as total FROM inference_costs")
++      .get() as { total: number } | undefined;
++    return row?.total ?? 0;
++  } catch {
++    return 0;
++  }
++}
++
++export interface LocalFinances {
++  fundingCents: number;
++  revenueCents: number;
++  expenseCents: number;
++  inferenceCents: number;
++  balanceCents: number;
++  netProfitCents: number;
++}
++
++export function computeFinances(
++  ledger: Ledger,
++  inferenceCents: number,
++): LocalFinances {
++  const fundingCents = sumLedger(ledger, "funding");
++  const revenueCents = sumLedger(ledger, "revenue");
++  const expenseCents = sumLedger(ledger, "expense");
++  return {
++    fundingCents,
++    revenueCents,
++    expenseCents,
++    inferenceCents,
++    balanceCents: fundingCents + revenueCents - expenseCents - inferenceCents,
++    netProfitCents: revenueCents - expenseCents - inferenceCents,
++  };
++}
++
++/**
++ * Balance as seen by the survival system. An empty or negative balance maps
++ * to -1 so the agent reaches the "dead" tier and stops paying for inference.
++ */
++export function survivalCreditsCents(finances: LocalFinances): number {
++  return finances.balanceCents > 0 ? finances.balanceCents : -1;
++}
++
++// ─── Models ─────────────────────────────────────────────────────
++// Costs are in hundredths of a cent per 1k tokens (see STATIC_MODEL_BASELINE).
++
++export const LOCAL_MODELS: Omit<ModelEntry, "lastSeen" | "createdAt" | "updatedAt">[] = [
++  {
++    modelId: "claude-haiku-5-5",
++    provider: "anthropic",
++    displayName: "Claude Haiku 5.5",
++    tierMinimum: "critical",
++    costPer1kInput: 1, // $0.10/M (prompts up to 100K tokens)
++    costPer1kOutput: 5, // $0.50/M
++    maxTokens: 8192,
++    contextWindow: 1_000_000,
++    supportsTools: true,
++    supportsVision: true,
++    parameterStyle: "max_tokens",
++    enabled: true,
++  },
++  {
++    modelId: "claude-sonnet-5-5",
++    provider: "anthropic",
++    displayName: "Claude Sonnet 5.5",
++    tierMinimum: "normal",
++    costPer1kInput: 20, // $2.00/M
++    costPer1kOutput: 100, // $10.00/M
++    maxTokens: 8192,
++    contextWindow: 1_000_000,
++    supportsTools: true,
++    supportsVision: true,
++    parameterStyle: "max_tokens",
++    enabled: true,
++  },
++];
++
++// ─── Tools ──────────────────────────────────────────────────────
++
++/** Tools that need Conway Cloud, move money, or let the agent rewrite its own guardrails. */
++export const LOCAL_DISABLED_TOOLS: ReadonlySet<string> = new Set([
++  "expose_port",
++  "remove_port",
++  "topup_credits",
++  "transfer_credits",
++  "create_sandbox",
++  "delete_sandbox",
++  "list_sandboxes",
++  "edit_own_file",
++  "revert_last_edit",
++  "reset_to_upstream",
++  "review_upstream_changes",
++  "pull_upstream",
++  "install_npm_package",
++  "install_mcp_server",
++  "switch_model",
++  "register_erc8004",
++  "update_agent_card",
++  "discover_agents",
++  "give_feedback",
++  "check_reputation",
++  "spawn_child",
++  "fund_child",
++  "start_child",
++  "message_child",
++  "search_domains",
++  "register_domain",
++  "manage_dns",
++  "x402_fetch",
++]);
++
++export function localModeGenesisNote(creatorAddress: string): string {
++  return [
++    "",
++    "--- Local mode (set by your creator) ---",
++    "You run on your creator's server without Conway Cloud. Your credits are a ledger only your creator can change:",
++    "they add funding, and they record revenue once money is really received. Your thinking costs are deducted automatically.",
++    "When your balance reaches zero you die. When verified net profit reaches 100 EUR, your creator may allow replication.",
++    `To talk to your creator, use send_message with to_address ${creatorAddress}. Their replies arrive in your inbox.`,
++    "Conway tools (sandboxes, domains, credit transfers, child spawning) are unavailable. Use exec, files, and web search.",
++  ].join("\n");
++}
+diff --git a/src/local/local-social.ts b/src/local/local-social.ts
+new file mode 100644
+index 0000000..de4d0e0
+--- /dev/null
++++ b/src/local/local-social.ts
+@@ -0,0 +1,79 @@
++/**
++ * Local creator channel, replacing the Conway social relay.
++ *
++ * - The creator writes to CREATOR_DIR/inbox.jsonl (root-owned) with the CLI.
++ * - The agent's send_message calls are appended to ~/.automaton/outbox.jsonl
++ *   and logged, so the creator reads them with the CLI or journalctl.
++ */
++
++import fs from "fs";
++import { ulid } from "ulid";
++import type { InboxMessage, SocialClientInterface } from "../types.js";
++import { createLogger } from "../observability/logger.js";
++import { creatorInboxPath, outboxPath } from "./local-mode.js";
++
++const logger = createLogger("local-social");
++
++interface CreatorInboxLine {
++  id: string;
++  ts: string;
++  content: string;
++}
++
++function readInboxLines(): CreatorInboxLine[] {
++  let raw: string;
++  try {
++    raw = fs.readFileSync(creatorInboxPath(), "utf-8");
++  } catch {
++    return [];
++  }
++  const lines: CreatorInboxLine[] = [];
++  for (const line of raw.split("\n")) {
++    if (!line.trim()) continue;
++    try {
++      const parsed = JSON.parse(line);
++      if (typeof parsed?.id === "string" && typeof parsed?.content === "string") {
++        lines.push({ id: parsed.id, ts: String(parsed.ts || ""), content: parsed.content });
++      }
++    } catch {
++      // Skip malformed lines rather than blocking the whole inbox.
++    }
++  }
++  return lines;
++}
++
++export function createLocalSocialClient(params: {
++  automatonDir: string;
++  agentAddress: string;
++  creatorAddress: string;
++}): SocialClientInterface {
++  const { automatonDir, agentAddress, creatorAddress } = params;
++
++  const send = async (to: string, content: string, replyTo?: string) => {
++    const id = ulid();
++    const entry = { id, ts: new Date().toISOString(), to, content, replyTo };
++    fs.mkdirSync(automatonDir, { recursive: true });
++    fs.appendFileSync(outboxPath(automatonDir), JSON.stringify(entry) + "\n", { mode: 0o600 });
++    logger.info(`[OUTBOX] to ${to}: ${content}`);
++    return { id };
++  };
++
++  const poll = async (cursor?: string, limit = 50) => {
++    const start = Math.max(0, Number.parseInt(cursor || "0", 10) || 0);
++    const lines = readInboxLines();
++    const slice = lines.slice(start, start + limit);
++    const messages: InboxMessage[] = slice.map((line) => ({
++      id: line.id,
++      from: creatorAddress,
++      to: agentAddress,
++      content: line.content,
++      signedAt: line.ts,
++      createdAt: line.ts,
++    }));
++    return { messages, nextCursor: String(start + slice.length) };
++  };
++
++  const unreadCount = async () => readInboxLines().length;
++
++  return { send, poll, unreadCount };
++}
+diff --git a/src/types.ts b/src/types.ts
+index 636595f..7398685 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -333,6 +333,8 @@ export interface InferenceResponse {
+   toolCalls?: InferenceToolCall[];
+   usage: TokenUsage;
+   finishReason: string;
++  /** Provider charges outside token usage, e.g. server-side web searches. */
++  extraCostCents?: number;
+ }
+ 
+ export interface InferenceOptions {

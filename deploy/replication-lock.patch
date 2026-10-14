@@ -1,0 +1,26 @@
+diff --git a/src/replication/spawn.ts b/src/replication/spawn.ts
+index 7776f63..aa418c2 100644
+--- a/src/replication/spawn.ts
++++ b/src/replication/spawn.ts
+@@ -59,6 +59,11 @@ export async function spawnChild(
+   genesis: GenesisConfig,
+   lifecycle?: ChildLifecycle,
+ ): Promise<ChildAutomaton> {
++  // Hard kill switch set by the creator: no replication at all.
++  if (process.env.AUTOMATON_DISABLE_REPLICATION === "1") {
++    throw new Error("Cannot spawn: replication is disabled by the creator.");
++  }
++
+   // Check child limit from config
+   const existing = db
+     .getChildren()
+@@ -68,7 +73,8 @@ export async function spawnChild(
+         c.status !== "cleaned_up" &&
+         c.status !== "failed",
+     );
+-  const maxChildren = (db as any).config?.maxChildren ?? 3;
++  const envMax = process.env.AUTOMATON_MAX_CHILDREN;
++  const maxChildren = envMax !== undefined ? Number(envMax) : ((db as any).config?.maxChildren ?? 3);
+   if (existing.length >= maxChildren) {
+     throw new Error(
+       `Cannot spawn: already at max children (${maxChildren}). Kill or wait for existing children to die.`,

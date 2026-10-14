@@ -11,3 +11,10 @@ dist
 .automaton/wallet.json
 .automaton/state.db
 
+node_modules/
+dist/
+.env
+*.env
+wallet.json
+config.json
+.automaton/

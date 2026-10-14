@@ -276,29 +276,45 @@ async function chatViaAnthropic(params: {
   httpClient: ResilientHttpClient;
 }): Promise<InferenceResponse> {
   const transformed = transformMessagesForAnthropic(params.messages);
+  ensureUserTurnBoundaries(transformed.messages);
   const body: Record<string, unknown> = {
     model: params.model,
     max_tokens: params.tokenLimit,
-    messages:
-      transformed.messages.length > 0
-        ? transformed.messages
-        : (() => { throw new Error("Cannot send empty message array to Anthropic API"); })(),
+    messages: transformed.messages,
   };
 
   if (transformed.system) {
     body.system = transformed.system;
   }
 
-  if (params.temperature !== undefined) {
+  // Claude 5.x models reject non-default sampling parameters.
+  const isClaude5 = /^claude-(haiku|sonnet|opus|fable)-5/.test(params.model);
+  if (params.temperature !== undefined && !isClaude5) {
     body.temperature = params.temperature;
   }
 
-  if (params.tools && params.tools.length > 0) {
-    body.tools = params.tools.map((tool) => ({
-      name: tool.function.name,
-      description: tool.function.description,
-      input_schema: tool.function.parameters,
-    }));
+  if (isClaude5) {
+    // The agent history keeps only text and tool calls, so thinking blocks
+    // could not be replayed with tool results. Run without thinking and use
+    // effort as the cost lever.
+    body.thinking = { type: "disabled" };
+    body.output_config = { effort: process.env.AUTOMATON_EFFORT || "low" };
+  }
+
+  const anthropicTools: Array<Record<string, unknown>> = (params.tools || []).map((tool) => ({
+    name: tool.function.name,
+    description: tool.function.description,
+    input_schema: tool.function.parameters,
+  }));
+  if (process.env.AUTOMATON_WEB_SEARCH === "1") {
+    anthropicTools.push({
+      type: "web_search_20250305",
+      name: "web_search",
+      max_uses: Number(process.env.AUTOMATON_WEB_SEARCH_MAX_USES || 3),
+    });
+  }
+  if (anthropicTools.length > 0) {
+    body.tools = anthropicTools;
     body.tool_choice = { type: "auto" };
   }
 
@@ -352,6 +368,9 @@ async function chatViaAnthropic(params: {
     totalTokens: promptTokens + completionTokens,
   };
 
+  // Web search is billed per search ($10 per 1,000), outside token usage.
+  const webSearches = Number(data.usage?.server_tool_use?.web_search_requests || 0);
+
   return {
     id: data.id || "",
     model: data.model || params.model,
@@ -363,6 +382,7 @@ async function chatViaAnthropic(params: {
     toolCalls,
     usage,
     finishReason: normalizeAnthropicFinishReason(data.stop_reason),
+    extraCostCents: webSearches,
   };
 }
 
@@ -383,6 +403,11 @@ function transformMessagesForAnthropic(
       const last = transformed[transformed.length - 1];
       if (last && last.role === "user" && typeof last.content === "string") {
         last.content = last.content + "\n" + msg.content;
+        continue;
+      }
+      // Text after tool results joins the same user turn as a text block.
+      if (last && last.role === "user" && Array.isArray(last.content)) {
+        (last.content as Array<Record<string, unknown>>).push({ type: "text", text: msg.content });
         continue;
       }
       transformed.push({
@@ -406,7 +431,8 @@ function transformMessagesForAnthropic(
         });
       }
       if (content.length === 0) {
-        content.push({ type: "text", text: "" });
+        // The Messages API rejects empty text blocks.
+        content.push({ type: "text", text: "(no output)" });
       }
       // Merge consecutive assistant messages
       const last = transformed[transformed.length - 1];
@@ -448,6 +474,23 @@ function transformMessagesForAnthropic(
     system: systemParts.length > 0 ? systemParts.join("\n\n") : undefined,
     messages: transformed,
   };
+}
+
+/**
+ * The Messages API needs a user turn first and last: current models reject a
+ * trailing assistant turn (prefill). The agent loop can produce either shape
+ * when it wakes with no new input, so add neutral user turns at the edges.
+ */
+function ensureUserTurnBoundaries(messages: Array<Record<string, unknown>>): void {
+  if (messages.length === 0 || messages[0].role !== "user") {
+    messages.unshift({ role: "user", content: "[Earlier context omitted.]" });
+  }
+  if (messages[messages.length - 1].role !== "user") {
+    messages.push({
+      role: "user",
+      content: "[No new input. Continue working toward your goals, or call sleep if there is nothing useful to do.]",
+    });
+  }
 }
 
 function parseToolArguments(raw: string): Record<string, unknown> {
