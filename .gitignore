@@ -18,3 +18,9 @@ dist/
 wallet.json
 config.json
 .automaton/
+
+# Hermes test venv / caches
+hermes/.venv/
+__pycache__/
+*.pyc
+hermes/tests/*.jsonl

@@ -1,0 +1,6 @@
+name: luna-rules
+version: 1.0.0
+description: Règles de luna — interdits, validation humaine des actions publiques, arrêt général
+author: Pierre Bournet
+provides_hooks:
+  - pre_tool_call

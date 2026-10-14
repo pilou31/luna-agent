@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# Commande de pilotage du système luna (à lancer en root : sudo luna <cmd>).
+set -euo pipefail
+
+GUARD_STATE="/var/lib/luna-guard"
+TOKENS="/etc/luna-guard/tokens.json"
+LEDGER="${GUARD_STATE}/ledger.json"
+HALT="${GUARD_STATE}/HALT"
+AGENT_USER="hermes"
+HERMES_BIN="$(sudo -u "${AGENT_USER}" -H bash -lc 'command -v hermes' 2>/dev/null || echo hermes)"
+MAX_COPIES=3
+
+need_root() { [ "$(id -u)" -eq 0 ] || exec sudo "$0" "$@"; }
+need_root "$@"
+
+euros() { python3 -c "print(f'{int($1)/100:.2f} €')"; }
+
+cmd="${1:-help}"; shift || true
+
+ledger_add() { # type euros note
+  python3 - "$LEDGER" "$1" "$2" "${3:-}" <<'PY'
+import json, sys, time, uuid
+path, kind, amount, note = sys.argv[1:5]
+cents = round(float(amount.replace(",", ".")) * 100)
+assert 0 < cents <= 10_000_000, "montant invalide"
+try:
+    data = json.load(open(path))
+except Exception:
+    data = {"entries": []}
+data.setdefault("entries", []).append(
+    {"id": str(uuid.uuid4()), "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+     "type": {"fund": "funding"}.get(kind, kind), "amountCents": cents, "note": note})
+json.dump(data, open(path, "w"), indent=2)
+print(f"Enregistré : {kind} {cents/100:.2f} €")
+PY
+  chown luna-guard:luna-guard "$LEDGER"; chmod 644 "$LEDGER"
+}
+
+active_copies() { systemctl list-units 'hermes@luna-*.service' --no-legend 2>/dev/null | grep -c .; }
+
+case "$cmd" in
+  status)
+    python3 - "$LEDGER" "$GUARD_STATE/spend.db" "$HALT" <<'PY'
+import json, os, sqlite3, sys
+ledger, db, halt = sys.argv[1:4]
+tot = {"funding": 0, "revenue": 0, "expense": 0}
+try:
+    for e in json.load(open(ledger)).get("entries", []):
+        if e.get("type") in tot and isinstance(e.get("amountCents"), int) and e["amountCents"] >= 0:
+            tot[e["type"]] += e["amountCents"] / 100
+except Exception:
+    pass
+spent = 0.0
+try:
+    spent = sqlite3.connect(db).execute("SELECT COALESCE(SUM(cost),0) FROM calls").fetchone()[0]
+except Exception:
+    pass
+life = tot["funding"] + tot["revenue"] - tot["expense"] - spent
+net = tot["revenue"] - tot["expense"] - spent
+print(f"Budget versé      : {tot['funding']:.2f} €")
+print(f"Ventes encaissées : {tot['revenue']:.2f} €")
+print(f"Dépenses business : {tot['expense']:.2f} €")
+print(f"Coût de l'IA      : {spent:.2f} € / 20.00 € (plafond commun)")
+print(f"Vie (solde)       : {life:.2f} €")
+print(f"Bénéfice net      : {net:.2f} €")
+if os.path.exists(halt):
+    print("ÉTAT             : ARRÊTÉ ->", open(halt).read().strip())
+PY
+    echo "Copies actives    : $(active_copies) / $((MAX_COPIES + 1))"
+    ;;
+  fund|revenue|expense)
+    [ $# -ge 1 ] || { echo "Usage : luna $cmd <euros> [note]"; exit 1; }
+    ledger_add "$cmd" "$1" "${2:-}"
+    ;;
+  start)
+    [ -e "$HALT" ] && { echo "Système arrêté. Lance d'abord : luna resume"; exit 1; }
+    systemctl start hermes@luna-0.service
+    echo "Agent principal luna-0 démarré. Journal : journalctl -u hermes@luna-0 -f"
+    ;;
+  copy)
+    [ -e "$HALT" ] && { echo "Système arrêté. Lance d'abord : luna resume"; exit 1; }
+    n=$(active_copies)
+    [ "$n" -le "$MAX_COPIES" ] || { echo "Plafond atteint : $MAX_COPIES copies maximum."; exit 1; }
+    for i in $(seq 1 "$MAX_COPIES"); do
+      prof="luna-$i"
+      systemctl is-active --quiet "hermes@${prof}.service" && continue
+      src="/home/${AGENT_USER}/.hermes"; dst="/home/${AGENT_USER}/.hermes-profiles/${prof}"
+      if [ ! -d "$dst" ]; then
+        install -d -o "${AGENT_USER}" -g "${AGENT_USER}" "/home/${AGENT_USER}/.hermes-profiles"
+        cp -r "$src" "$dst"
+        tok=$(python3 -c "import json;print(json.load(open('$TOKENS'))['$prof'])")
+        printf 'ANTHROPIC_API_KEY=%s\nANTHROPIC_BASE_URL=http://127.0.0.1:8787\n' "$tok" > "$dst/.env"
+        chown root:root "$dst/.env"; chgrp "${AGENT_USER}" "$dst/.env"; chmod 640 "$dst/.env"
+      fi
+      systemctl start "hermes@${prof}.service"
+      echo "Copie ${prof} démarrée."
+      exit 0
+    done
+    echo "Toutes les copies autorisées tournent déjà."
+    ;;
+  stop-all)
+    systemctl stop 'hermes@*.service' 2>/dev/null || true
+    echo "$(date +%FT%T) stop-all par le créateur" > "$HALT"
+    chown luna-guard:luna-guard "$HALT" 2>/dev/null || true
+    echo "Toutes les copies arrêtées. luna-guard refuse désormais les appels."
+    echo "Pour relancer : luna resume"
+    ;;
+  resume)
+    rm -f "$HALT"
+    echo "Verrou d'arrêt levé. Démarre un agent avec : luna start"
+    ;;
+  gateway)
+    sudo -u "${AGENT_USER}" -H "${HERMES_BIN}" -p luna-0 gateway setup
+    echo "Pense à limiter l'accès : TELEGRAM_ALLOWED_USERS=<ton id> dans ~hermes/.hermes/.env"
+    ;;
+  *)
+    cat <<EOF
+Usage : sudo luna <commande>
+  status                état des comptes et des copies
+  fund <euros> [note]   ajouter du budget
+  revenue <euros> [note] vente encaissée
+  expense <euros> [note] dépense business
+  gateway               connecter Telegram
+  start                 démarrer l'agent principal
+  copy                  créer une copie (max ${MAX_COPIES})
+  stop-all              arrêt d'urgence de toutes les copies
+  resume                relancer après un arrêt
+EOF
+    ;;
+esac
