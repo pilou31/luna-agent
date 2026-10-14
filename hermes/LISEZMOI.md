@@ -23,6 +23,15 @@ Fait tourner l'agent **luna** sur [Hermes Agent](https://github.com/NousResearch
 La vraie garantie n'est pas le filtre de mots, c'est que l'agent **n'a aucun identifiant** de
 tes comptes ni moyen de paiement, et que le budget est plafonné côté gardien.
 
+## Bascule depuis l'ancien agent Conway
+
+```bash
+cd hermes/deploy && sudo bash migrate-from-conway.sh   # arrête Conway, sauvegarde, reprend le registre
+sudo bash install-hermes.sh                            # installe Hermes
+```
+La bascule conserve tout : état sauvegardé dans `/root/conway-backup-*.tar.gz`, registre
+(budget/ventes/dépenses) repris dans luna-guard, travaux copiés dans `/home/hermes/from-conway`.
+
 ## Installation (VPS Ubuntu 24.04, en root)
 
 ```bash
