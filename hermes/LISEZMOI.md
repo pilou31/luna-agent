@@ -52,7 +52,7 @@ l'agent sur la même machine ; à défaut, vérifier que les clés Tradovate son
 À ajouter au fur et à mesure — chacun publie sur **un** compte réel que tu possèdes, jamais
 de création de comptes en série :
 
-- **Pinterest** (API officielle) — demandé, à intégrer.
+- **Pinterest** (API officielle) — FAIT : `content/pinterest.py` + compétence `pinterest-publish`, 6 tests. Publie sur ton compte, autonome (réglage C). Setup : app développeur Pinterest + `python3 pinterest.py connect`.
 - **YouTube comptines** (API officielle) — en attente de ton tuto.
 - **Séries IA** — contenu original généré, publié sur tes chaînes.
 
