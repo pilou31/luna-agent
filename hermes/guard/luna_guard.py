@@ -349,17 +349,20 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
-        # Model discovery is unauthenticated: OpenAI-compatible clients probe it
-        # (without the key) to detect the endpoint before sending a keyed request.
-        # It only reveals model names, and the guard listens on 127.0.0.1 only.
-        if path in ("/v1/models", "/models", "/api/v1/models"):
+        # ONLY the canonical OpenAI path answers 200 (unauthenticated: clients probe
+        # it without the key, it reveals only model names, and we listen on 127.0.0.1).
+        # Everything else is a clean 404 on purpose. In particular Hermes' local-server
+        # detection treats a 200 on /api/v1/models as "this is LM Studio" without even
+        # checking the body, then applies LM Studio quirks that break the request; a 404
+        # there (and on /api/tags, /v1/props, /props, /version) makes detection find no
+        # known local server, so Hermes falls back to a plain OpenAI endpoint and POSTs
+        # /v1/chat/completions.
+        if path == "/v1/models":
             return self._json(200, OPENAI_MODELS)
         if path == "/luna/status":
             if not self._agent():
                 return self._error(401, "unknown agent token")
             return self._json(200, GUARD.status())
-        # Any other probe (Ollama /api/tags, llama.cpp /props, /version, ...):
-        # a clean 404 so the client rules those server types out and settles on OpenAI.
         return self._error(404, "not found")
 
     def do_POST(self) -> None:
