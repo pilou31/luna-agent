@@ -62,7 +62,7 @@ fi
 chown root:"${GUARD_USER}" /etc/luna-guard/tokens.json
 chmod 640 /etc/luna-guard/tokens.json
 
-# ─── Utilisateur de l'agent (sans sudo, isolé) ──────────────────────────────
+# ─── Utilisateur de l'agent (sans sudo, isolé) ───────────────────────────
 echo "==> Utilisateur ${AGENT_USER} (sans droits admin)"
 id "${AGENT_USER}" >/dev/null 2>&1 || useradd --create-home --shell /bin/bash "${AGENT_USER}"
 chmod 700 "${AGENT_HOME}"
@@ -88,9 +88,11 @@ cp -r "${PLUGIN_SRC}" "${PROFILE_HOME}/plugins/luna-rules"
 # Config et plugin appartiennent à root : l'agent ne peut pas les réécrire.
 cat > "${PROFILE_HOME}/config.yaml" <<EOF
 model:
-  provider: anthropic
   default: ${MODEL}
-  base_url: http://127.0.0.1:8787
+  provider: custom
+  base_url: http://127.0.0.1:8787/v1
+  context_length: 200000
+  key_env: HERMES_LLM_KEY
 plugins:
   enabled: [luna-rules]
 approvals:
@@ -107,8 +109,8 @@ skills:
 EOF
 TOKEN0="$(python3 -c 'import json;print(json.load(open("/etc/luna-guard/tokens.json"))["luna-0"])')"
 cat > "${PROFILE_HOME}/.env" <<EOF
+HERMES_LLM_KEY=${TOKEN0}
 ANTHROPIC_API_KEY=${TOKEN0}
-ANTHROPIC_BASE_URL=http://127.0.0.1:8787
 EOF
 chown root:root "${PROFILE_HOME}/config.yaml" "${PROFILE_HOME}/.env"
 chmod 644 "${PROFILE_HOME}/config.yaml"; chmod 640 "${PROFILE_HOME}/.env"
@@ -156,7 +158,7 @@ ConditionPathExists=!/var/lib/luna-guard/HALT
 User=${AGENT_USER}
 WorkingDirectory=${AGENT_HOME}
 Environment=HOME=${AGENT_HOME}
-ExecStart=${HERMES_BIN} -p %i gateway run --replace
+ExecStart=${HERMES_BIN} gateway run
 Restart=on-failure
 RestartSec=30
 NoNewPrivileges=true
