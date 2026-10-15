@@ -55,6 +55,14 @@ CACHE_READ = 0.1
 ALLOWED_AGENTS = [f"luna-{i}" for i in range(MAX_COPIES + 1)]
 AGENT_NAME_RE = re.compile(r"^luna-\d+$")
 
+# Neutral model names the agent asks for, mapped to the real Anthropic model the
+# guard forwards. A "claude-*" name makes Hermes apply Anthropic-specific thinking
+# logic that breaks on a custom/OpenAI provider; a neutral alias avoids it.
+MODEL_ALIASES = {
+    "luna-haiku": "claude-haiku-5-5",
+    "luna-sonnet": "claude-sonnet-5-5",
+}
+
 # ─── Paths and settings (set by the root-owned systemd unit) ────────────────
 
 STATE_DIR = os.environ.get("LUNA_GUARD_STATE_DIR", "/var/lib/luna-guard")
@@ -317,8 +325,8 @@ HOP_HEADERS = {
 OPENAI_MODELS = {
     "object": "list",
     "data": [
-        {"id": name, "object": "model", "created": 0, "owned_by": "anthropic"}
-        for name in PRICES
+        {"id": name, "object": "model", "created": 0, "owned_by": "luna"}
+        for name in MODEL_ALIASES
     ],
 }
 
@@ -401,10 +409,15 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(body or b"{}")
         except ValueError:
             return self._error(400, "invalid JSON")
-        model = str(payload.get("model") or "")
+        requested = str(payload.get("model") or "")
+        model = MODEL_ALIASES.get(requested, requested)  # neutral alias -> real Anthropic model
         if model not in PRICES:
-            return self._error(400, f"model not allowed by luna-guard: {model}")
+            return self._error(400, f"model not allowed by luna-guard: {requested}")
 
+        changed = False
+        if requested != model:
+            payload["model"] = model
+            changed = True
         # Make streaming responses report their token usage so we can bill them.
         if style == "openai" and payload.get("stream"):
             options = payload.get("stream_options")
@@ -412,6 +425,8 @@ class Handler(BaseHTTPRequestHandler):
                 options = {}
             options["include_usage"] = True
             payload["stream_options"] = options
+            changed = True
+        if changed:
             body = json.dumps(payload).encode()
 
         estimate = estimate_request(model, body, payload)
