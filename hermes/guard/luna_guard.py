@@ -14,7 +14,8 @@ with its own opaque token instead of the real key. The guard:
 
 It speaks two shapes so any client fits:
 - OpenAI-compatible: GET /v1/models, POST /v1/chat/completions  (Hermes uses this;
-  it is relayed to Anthropic's own OpenAI-compatibility endpoint, no translation);
+  it is relayed to Anthropic's own OpenAI-compatibility endpoint, no translation;
+  GET /version identifies the guard as vLLM so Hermes accepts the local endpoint);
 - Anthropic-native:  POST /v1/messages (+ /v1/messages/count_tokens).
 
 Only root can lift the latch (`luna resume`). Agents can only request a stop.
@@ -349,16 +350,20 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
-        # ONLY the canonical OpenAI path answers 200 (unauthenticated: clients probe
-        # it without the key, it reveals only model names, and we listen on 127.0.0.1).
-        # Everything else is a clean 404 on purpose. In particular Hermes' local-server
-        # detection treats a 200 on /api/v1/models as "this is LM Studio" without even
-        # checking the body, then applies LM Studio quirks that break the request; a 404
-        # there (and on /api/tags, /v1/props, /props, /version) makes detection find no
-        # known local server, so Hermes falls back to a plain OpenAI endpoint and POSTs
-        # /v1/chat/completions.
+        # ONLY the canonical OpenAI path answers 200 with the model list; the probe
+        # below identifies the server type. Unauthenticated on purpose (clients probe
+        # without the key; only model names are revealed; we listen on 127.0.0.1).
         if path == "/v1/models":
             return self._json(200, OPENAI_MODELS)
+        # Identify as vLLM (a plain OpenAI-compatible server): Hermes' detection
+        # requires a known local server type for a 127.0.0.1 endpoint, else it
+        # refuses with invalid_params before trying /v1/chat/completions. vLLM is
+        # detected by GET /version returning JSON with a "version" key, and it makes
+        # Hermes speak standard OpenAI (/v1/models + /v1/chat/completions). The other
+        # probes (/api/v1/models=LM Studio, /api/tags=Ollama, /v1/props,/props=llama.cpp)
+        # must stay 404 so they don't win detection first.
+        if path == "/version":
+            return self._json(200, {"version": "luna-guard"})
         if path == "/luna/status":
             if not self._agent():
                 return self._error(401, "unknown agent token")
