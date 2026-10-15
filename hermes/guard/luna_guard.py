@@ -348,16 +348,19 @@ class Handler(BaseHTTPRequestHandler):
         return GUARD.agent_for_token(token)
 
     def do_GET(self) -> None:
-        agent = self._agent()
-        if not agent:
-            return self._error(401, "unknown agent token")
         path = urlsplit(self.path).path
-        if path == "/luna/status":
-            return self._json(200, GUARD.status())
-        # OpenAI-compatible model discovery (clients probe this to detect the endpoint).
+        # Model discovery is unauthenticated: OpenAI-compatible clients probe it
+        # (without the key) to detect the endpoint before sending a keyed request.
+        # It only reveals model names, and the guard listens on 127.0.0.1 only.
         if path in ("/v1/models", "/models", "/api/v1/models"):
             return self._json(200, OPENAI_MODELS)
-        return self._error(404, "path not allowed")
+        if path == "/luna/status":
+            if not self._agent():
+                return self._error(401, "unknown agent token")
+            return self._json(200, GUARD.status())
+        # Any other probe (Ollama /api/tags, llama.cpp /props, /version, ...):
+        # a clean 404 so the client rules those server types out and settles on OpenAI.
+        return self._error(404, "not found")
 
     def do_POST(self) -> None:
         agent = self._agent()
