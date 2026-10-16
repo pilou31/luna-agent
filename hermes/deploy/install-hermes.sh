@@ -15,7 +15,7 @@ KIT_DIR="$(cd "$(dirname "$0")/.." && pwd)"   # .../hermes
 GUARD_SRC="${KIT_DIR}/guard/luna_guard.py"
 PLUGIN_SRC="${KIT_DIR}/plugin/luna-rules"
 CLI_SRC="${KIT_DIR}/deploy/luna"
-MODEL="claude-haiku-5-5"
+MODEL="luna-haiku"   # neutral alias; luna-guard maps it to claude-haiku-5-5 upstream
 
 [ "$(id -u)" -eq 0 ] || { echo "Lance ce script en root (sudo)."; exit 1; }
 [ -f "${GUARD_SRC}" ] || { echo "guard/luna_guard.py introuvable."; exit 1; }
@@ -86,11 +86,14 @@ PROFILE_HOME="${AGENT_HOME}/.hermes"
 install -d -o "${AGENT_USER}" -g "${AGENT_USER}" "${PROFILE_HOME}/plugins"
 cp -r "${PLUGIN_SRC}" "${PROFILE_HOME}/plugins/luna-rules"
 # Config et plugin appartiennent à root : l'agent ne peut pas les réécrire.
+TOKEN0="$(python3 -c 'import json;print(json.load(open("/etc/luna-guard/tokens.json"))["luna-0"])')"
 cat > "${PROFILE_HOME}/config.yaml" <<EOF
 model:
-  provider: anthropic
   default: ${MODEL}
-  base_url: http://127.0.0.1:8787
+  provider: custom
+  base_url: http://127.0.0.1:8787/v1
+  context_length: 200000
+  api_key: ${TOKEN0}
 plugins:
   enabled: [luna-rules]
 approvals:
@@ -105,17 +108,16 @@ delegation:
 skills:
   autonomous_creation: true
 EOF
-TOKEN0="$(python3 -c 'import json;print(json.load(open("/etc/luna-guard/tokens.json"))["luna-0"])')"
 cat > "${PROFILE_HOME}/.env" <<EOF
+HERMES_LLM_KEY=${TOKEN0}
 ANTHROPIC_API_KEY=${TOKEN0}
-ANTHROPIC_BASE_URL=http://127.0.0.1:8787
 EOF
 chown root:root "${PROFILE_HOME}/config.yaml" "${PROFILE_HOME}/.env"
-chmod 644 "${PROFILE_HOME}/config.yaml"; chmod 640 "${PROFILE_HOME}/.env"
+chmod 640 "${PROFILE_HOME}/config.yaml"; chmod 640 "${PROFILE_HOME}/.env"
 chown -R root:root "${PROFILE_HOME}/plugins/luna-rules"
 chmod -R a+rX,go-w "${PROFILE_HOME}/plugins/luna-rules"
-# L'agent doit pouvoir lire le .env : groupe = agent.
-chgrp "${AGENT_USER}" "${PROFILE_HOME}/.env"
+# L'agent (root-owned config) doit pouvoir LIRE config.yaml et .env : groupe = agent.
+chgrp "${AGENT_USER}" "${PROFILE_HOME}/config.yaml" "${PROFILE_HOME}/.env"
 
 echo "==> Services systemd"
 cat > /etc/systemd/system/luna-guard.service <<EOF
@@ -156,7 +158,7 @@ ConditionPathExists=!/var/lib/luna-guard/HALT
 User=${AGENT_USER}
 WorkingDirectory=${AGENT_HOME}
 Environment=HOME=${AGENT_HOME}
-ExecStart=${HERMES_BIN} -p %i gateway run --replace
+ExecStart=${HERMES_BIN} gateway run
 Restart=on-failure
 RestartSec=30
 NoNewPrivileges=true
@@ -183,10 +185,11 @@ WantedBy=multi-user.target
 EOF
 cat > /etc/systemd/system/luna-halt.service <<EOF
 [Unit]
-Description=Arrete toutes les copies luna
+Description=Arrete toutes les copies luna (systeme + gateway utilisateur)
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/systemctl stop 'hermes@*.service'
+ExecStart=-/usr/bin/systemctl stop hermes@*.service
+ExecStart=-/usr/bin/runuser -u ${AGENT_USER} -- bash -lc 'hermes gateway stop'
 EOF
 
 install -d "${AGENT_HOME}/apps" "${AGENT_HOME}/work"

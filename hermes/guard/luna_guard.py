@@ -12,6 +12,11 @@ with its own opaque token instead of the real key. The guard:
 - accepts at most MAX_COPIES copies besides luna-0, whatever the token file says;
 - raises a HALT latch that a root systemd unit turns into "stop every agent".
 
+It speaks two shapes so any client fits:
+- OpenAI-compatible: GET /v1/models, POST /v1/chat/completions  (Hermes uses this;
+  it is relayed to Anthropic's own OpenAI-compatibility endpoint, no translation);
+- Anthropic-native:  POST /v1/messages (+ /v1/messages/count_tokens).
+
 Only root can lift the latch (`luna resume`). Agents can only request a stop.
 Standard library only, so the whole trusted surface is this file.
 """
@@ -49,6 +54,14 @@ CACHE_READ = 0.1
 ALLOWED_AGENTS = [f"luna-{i}" for i in range(MAX_COPIES + 1)]
 AGENT_NAME_RE = re.compile(r"^luna-\d+$")
 
+# Neutral model names the agent asks for, mapped to the real Anthropic model the
+# guard forwards. A "claude-*" name makes Hermes apply Anthropic-specific thinking
+# logic that breaks on a custom/OpenAI provider; a neutral alias avoids it.
+MODEL_ALIASES = {
+    "luna-haiku": "claude-haiku-5-5",
+    "luna-sonnet": "claude-sonnet-5-5",
+}
+
 # ─── Paths and settings (set by the root-owned systemd unit) ────────────────
 
 STATE_DIR = os.environ.get("LUNA_GUARD_STATE_DIR", "/var/lib/luna-guard")
@@ -70,8 +83,8 @@ def db_path() -> str:
 # ─── Pricing ────────────────────────────────────────────────────────────────
 
 
-def price_usage(model: str, usage: dict) -> float:
-    """Cost in EUR of one response's usage block. Unknown models are priced by the caller's refusal."""
+def price_anthropic(model: str, usage: dict) -> float:
+    """Cost in EUR of one native /v1/messages response's usage block."""
     p_in, p_out, p_in_long, p_out_long, threshold = PRICES[model]
     cache = usage.get("cache_creation") or {}
     write_5m = int(cache.get("ephemeral_5m_input_tokens") or 0)
@@ -98,11 +111,30 @@ def price_usage(model: str, usage: dict) -> float:
     return cost + searches * WEB_SEARCH_EUR
 
 
+def price_openai(model: str, usage: dict) -> float:
+    """Cost in EUR of one /v1/chat/completions usage block (no cache split: slight overcount)."""
+    p_in, p_out, p_in_long, p_out_long, threshold = PRICES[model]
+    pin = int(usage.get("prompt_tokens") or 0)
+    pout = int(usage.get("completion_tokens") or 0)
+    if pin > threshold:
+        p_in, p_out = p_in_long, p_out_long
+    return (pin * p_in + pout * p_out) / 1_000_000
+
+
+def price_usage(style: str, model: str, usage: dict) -> float:
+    return price_openai(model, usage) if style == "openai" else price_anthropic(model, usage)
+
+
+def has_output(style: str, usage: dict) -> bool:
+    key = "completion_tokens" if style == "openai" else "output_tokens"
+    return usage.get(key) is not None
+
+
 def estimate_request(model: str, body: bytes, payload: dict) -> float:
     """Upper-bound cost of a request before it runs: ~3 bytes per token, full max_tokens output."""
     p_in, p_out, p_in_long, p_out_long, threshold = PRICES[model]
     in_tokens = len(body) // 3 + 1
-    out_tokens = int(payload.get("max_tokens") or 4096)
+    out_tokens = int(payload.get("max_tokens") or payload.get("max_completion_tokens") or 4096)
     if in_tokens > threshold:
         p_in, p_out = p_in_long, p_out_long
     return (in_tokens * p_in + out_tokens * p_out) / 1_000_000
@@ -215,8 +247,8 @@ class Guard:
                         time.time(),
                         agent,
                         model,
-                        int((usage or {}).get("input_tokens") or 0),
-                        int((usage or {}).get("output_tokens") or 0),
+                        int((usage or {}).get("input_tokens") or (usage or {}).get("prompt_tokens") or 0),
+                        int((usage or {}).get("output_tokens") or (usage or {}).get("completion_tokens") or 0),
                         cost,
                     ),
                 )
@@ -231,7 +263,7 @@ def log(message: str) -> None:
     print(f"[luna-guard] {message}", file=sys.stderr, flush=True)
 
 
-# ─── Usage extraction ───────────────────────────────────────────────────────
+# ─── Usage extraction from streaming responses ───────────────────────────────
 
 
 def merge_usage(total: dict, part: dict | None) -> None:
@@ -245,7 +277,7 @@ def merge_usage(total: dict, part: dict | None) -> None:
             total[key] = max(total.get(key, 0), value)
 
 
-def usage_from_sse_line(line: bytes, total: dict) -> None:
+def anthropic_usage_from_sse(line: bytes, total: dict) -> None:
     if not line.startswith(b"data:"):
         return
     try:
@@ -258,12 +290,43 @@ def usage_from_sse_line(line: bytes, total: dict) -> None:
         merge_usage(total, event.get("usage"))
 
 
+def openai_usage_from_sse(line: bytes, total: dict) -> None:
+    if not line.startswith(b"data:"):
+        return
+    payload = line[5:].strip()
+    if not payload or payload == b"[DONE]":
+        return
+    try:
+        event = json.loads(payload)
+    except ValueError:
+        return
+    usage = event.get("usage")
+    if isinstance(usage, dict):
+        # OpenAI reports a single final cumulative usage block; take it as-is.
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            value = usage.get(key)
+            if isinstance(value, (int, float)):
+                total[key] = value
+
+
+def usage_from_sse_line(style: str, line: bytes, total: dict) -> None:
+    (openai_usage_from_sse if style == "openai" else anthropic_usage_from_sse)(line, total)
+
+
 # ─── HTTP proxy ─────────────────────────────────────────────────────────────
 
 HOP_HEADERS = {
     "host", "content-length", "connection", "keep-alive", "transfer-encoding",
     "proxy-connection", "upgrade", "te", "trailer", "accept-encoding",
     "x-api-key", "authorization",
+}
+
+OPENAI_MODELS = {
+    "object": "list",
+    "data": [
+        {"id": name, "object": "model", "created": 0, "owned_by": "luna"}
+        for name in MODEL_ALIASES
+    ],
 }
 
 
@@ -293,15 +356,29 @@ class Handler(BaseHTTPRequestHandler):
         return GUARD.agent_for_token(token)
 
     def do_GET(self) -> None:
-        agent = self._agent()
-        if not agent:
-            return self._error(401, "unknown agent token")
         path = urlsplit(self.path).path
+        # ONLY the canonical OpenAI path answers 200 (unauthenticated: clients probe
+        # it without the key, it reveals only model names, and we listen on 127.0.0.1).
+        # Everything else is a clean 404 on purpose. In particular Hermes' local-server
+        # detection treats a 200 on /api/v1/models as "this is LM Studio" without even
+        # checking the body, then applies LM Studio quirks that break the request; a 404
+        # there (and on /api/tags, /v1/props, /props, /version) makes detection find no
+        # known local server, so Hermes falls back to a plain OpenAI endpoint and POSTs
+        # /v1/chat/completions.
+        if path == "/v1/models":
+            return self._json(200, OPENAI_MODELS)
+        # Identify as vLLM (a plain OpenAI-compatible server): Hermes' detection
+        # requires a known local server type for a 127.0.0.1 endpoint, else it
+        # refuses with invalid_params before trying /v1/chat/completions. vLLM is
+        # detected by GET /version returning JSON with a "version" key, and it makes
+        # Hermes speak standard OpenAI (/v1/models + /v1/chat/completions).
+        if path == "/version":
+            return self._json(200, {"version": "luna-guard"})
         if path == "/luna/status":
+            if not self._agent():
+                return self._error(401, "unknown agent token")
             return self._json(200, GUARD.status())
-        if path.startswith("/v1/models"):
-            return self._forward(agent, b"", None)
-        return self._error(403, "path not allowed")
+        return self._error(404, "not found")
 
     def do_POST(self) -> None:
         agent = self._agent()
@@ -318,9 +395,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"halted": True})
 
         if path == "/v1/messages/count_tokens":
-            return self._forward(agent, body, None)
-        if path != "/v1/messages":
-            return self._error(403, "path not allowed")
+            return self._forward(agent, body, None, "anthropic")
+
+        if path == "/v1/chat/completions":
+            style = "openai"
+        elif path == "/v1/messages":
+            style = "anthropic"
+        else:
+            return self._error(404, "path not allowed")
 
         halted = GUARD.check_limits()
         if halted:
@@ -329,16 +411,33 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(body or b"{}")
         except ValueError:
             return self._error(400, "invalid JSON")
-        model = str(payload.get("model") or "")
+        requested = str(payload.get("model") or "")
+        model = MODEL_ALIASES.get(requested, requested)  # neutral alias -> real Anthropic model
         if model not in PRICES:
-            return self._error(400, f"model not allowed by luna-guard: {model}")
+            return self._error(400, f"model not allowed by luna-guard: {requested}")
+
+        changed = False
+        if requested != model:
+            payload["model"] = model
+            changed = True
+        # Make streaming responses report their token usage so we can bill them.
+        if style == "openai" and payload.get("stream"):
+            options = payload.get("stream_options")
+            if not isinstance(options, dict):
+                options = {}
+            options["include_usage"] = True
+            payload["stream_options"] = options
+            changed = True
+        if changed:
+            body = json.dumps(payload).encode()
+
         estimate = estimate_request(model, body, payload)
         if not GUARD.reserve(estimate):
             GUARD.check_limits()
             return self._error(402, "not enough budget left for this request")
-        self._forward(agent, body, (model, estimate))
+        self._forward(agent, body, (model, estimate, style), style)
 
-    def _forward(self, agent: str, body: bytes, metered: tuple[str, float] | None) -> None:
+    def _forward(self, agent: str, body: bytes, metered: tuple | None, style: str) -> None:
         up = urlsplit(UPSTREAM)
         if up.scheme == "https":
             conn = http.client.HTTPSConnection(up.hostname, up.port or 443, timeout=600,
@@ -346,7 +445,11 @@ class Handler(BaseHTTPRequestHandler):
         else:
             conn = http.client.HTTPConnection(up.hostname, up.port or 80, timeout=600)
         headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_HEADERS}
-        headers["x-api-key"] = os.environ.get("ANTHROPIC_API_KEY", "")
+        real_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if style == "openai":
+            headers["authorization"] = f"Bearer {real_key}"
+        else:
+            headers["x-api-key"] = real_key
         headers["accept-encoding"] = "identity"
         if body:
             headers["content-length"] = str(len(body))
@@ -372,7 +475,7 @@ class Handler(BaseHTTPRequestHandler):
                     if not line:
                         break
                     if metered:
-                        usage_from_sse_line(line, usage)
+                        usage_from_sse_line(style, line, usage)
                     self.wfile.write(line)
                     self.wfile.flush()
             else:
@@ -380,7 +483,7 @@ class Handler(BaseHTTPRequestHandler):
                 if metered and resp.status == 200:
                     try:
                         merge_usage(usage, json.loads(data).get("usage"))
-                    except ValueError:
+                    except (ValueError, AttributeError):
                         pass
                 if metered:
                     # Record the cost before the agent sees the answer.
@@ -407,16 +510,16 @@ class Handler(BaseHTTPRequestHandler):
             conn.close()
 
     @staticmethod
-    def _settle(agent: str, metered: tuple[str, float], status: int, usage: dict, complete: bool) -> float:
+    def _settle(agent: str, metered: tuple, status: int, usage: dict, complete: bool) -> float:
         """Upstream errors and unsent requests cost nothing; a success is priced from its usage,
         and a success without usage, or a stream cut short, costs the full estimate."""
-        model, estimate = metered
+        model, estimate, style = metered
         if status != 200:
             cost = 0.0
-        elif complete and usage.get("output_tokens") is not None:
-            cost = price_usage(model, usage)
+        elif complete and has_output(style, usage):
+            cost = price_usage(style, model, usage)
         else:
-            cost = max(estimate, price_usage(model, usage) if usage else 0.0)
+            cost = max(estimate, price_usage(style, model, usage) if usage else 0.0)
         return GUARD.settle(estimate, agent, model, cost, usage)
 
 
