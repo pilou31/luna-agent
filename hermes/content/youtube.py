@@ -124,7 +124,7 @@ def _api(method: str, url: str, token: str, body: bytes | None = None,
         sys.exit(f"API YouTube erreur {exc.code} : {detail}")
 
 
-# ─── connect ───────────────────────────────────────────────────────
+# ─── connect ───────────────────────────────────────────────────
 
 
 def connect() -> None:
@@ -147,10 +147,17 @@ def connect() -> None:
     print("   La page échoue (normal). Copie la valeur APRÈS 'code=' dans la barre d'adresse")
     print("   (jusqu'au prochain '&'), ou colle l'URL complète ci-dessous.\n")
     raw = input("Colle le code (ou l'URL complète) puis Entrée : ").strip()
-    code = raw
-    if "code=" in raw:
-        code = urllib.parse.parse_qs(urllib.parse.urlsplit(raw).query).get("code", [raw])[0]
-    code = urllib.parse.unquote(code)
+    if raw.lower().startswith("http"):
+        # URL complète : extraire le paramètre ?code=...
+        code = urllib.parse.parse_qs(urllib.parse.urlsplit(raw).query).get("code", [""])[0]
+    else:
+        # Tolère "code=XXX", "code=XXX&...", ou juste "XXX".
+        code = raw.split("&", 1)[0].strip()
+        if code.startswith("code="):
+            code = code[len("code="):]
+    code = urllib.parse.unquote(code).strip()
+    if not code:
+        sys.exit("Aucun code lu. Recommence et colle la valeur après 'code='.")
     data = _post_form(TOKEN_URL, {
         "client_id": client_id,
         "client_secret": _env("YOUTUBE_CLIENT_SECRET"),
